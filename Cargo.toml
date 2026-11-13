@@ -6,6 +6,7 @@ rust-version = "1.85.1"
 publish = false
 description = "Safe Rust bindings to edlib sequence alignment"
 repository = "https://github.com/tmokveld/edlib-rs"
+license = "MIT"
 
 [workspace]
 members = ["edlib-sys"]

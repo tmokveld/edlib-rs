@@ -67,3 +67,8 @@ UPDATE_BINDINGS=1 cargo test -p edlib-sys --features bindgen
 
 Without `UPDATE_BINDINGS`, that command checks for drift without updating the
 committed file. Run `cargo doc --open` for the Rust interface documentation.
+
+## License
+
+Both Rust crates are licensed under the [MIT License](LICENSE).
+The bundled Edlib library retains its own [MIT license and copyright notice](edlib-sys/edlib/LICENSE).

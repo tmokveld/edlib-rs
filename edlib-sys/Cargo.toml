@@ -7,6 +7,7 @@ publish = false
 links = "edlib"
 description = "Raw bindings to bundled edlib"
 repository = "https://github.com/tmokveld/edlib-rs"
+license = "MIT"
 
 [features]
 # Regenerate bindings with bindgen (requires libclang) instead of using the

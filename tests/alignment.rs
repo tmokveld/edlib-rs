@@ -248,6 +248,111 @@ fn empty_inputs_honor_distance_limit_and_task() {
 }
 
 #[test]
+fn empty_infix_reports_every_target_boundary() {
+    for target in [b"".as_slice(), b"AC".as_slice()] {
+        for task in TASKS {
+            let config = AlignConfig {
+                mode: AlignmentMode::Infix,
+                task,
+                max_distance: Some(0),
+                ..Default::default()
+            };
+            let result = align(b"", target, &config).unwrap();
+            assert_eq!(result.edit_distance(), Some(0));
+            assert_eq!(
+                result.end_offsets().collect::<Vec<_>>(),
+                (0..=target.len()).collect::<Vec<_>>()
+            );
+            if task == AlignmentTask::Distance {
+                assert!(result.locations().is_none());
+            } else {
+                assert_eq!(
+                    result.locations().unwrap().collect::<Vec<_>>(),
+                    (0..=target.len()).map(|i| i..i).collect::<Vec<_>>()
+                );
+            }
+            if task == AlignmentTask::Path {
+                assert_eq!(result.path(), Some([].as_slice()));
+                assert_eq!(
+                    result.cigar(CigarFormat::Extended).unwrap().to_string(),
+                    ""
+                );
+            } else {
+                assert!(result.path().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn word_boundary_queries_match_reference() {
+    // Exercise the single-word kernel and its transition to multiple words.
+    for len in [1, 63, 64, 65, 127, 128, 129] {
+        let mut state = 42u64;
+        let query: Vec<u8> = (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state % 4) as usize]
+            })
+            .collect();
+        let mut mutated = query.clone();
+        mutated[len / 2] = b'N';
+        let mut embedded = b"NN".to_vec();
+        embedded.extend_from_slice(&query);
+        embedded.extend_from_slice(b"NN");
+        for target in [
+            query.as_slice(),
+            mutated.as_slice(),
+            &query[..len / 2],
+            embedded.as_slice(),
+        ] {
+            for mode in MODES {
+                let expected = reference_distance(&query, target, mode);
+                for task in TASKS {
+                    for limit in [None, Some(0), Some(expected), Some(expected.saturating_sub(1))] {
+                        let result = align(
+                            &query,
+                            target,
+                            &AlignConfig {
+                                mode,
+                                task,
+                                max_distance: limit,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                        let distance = match limit {
+                            Some(k) if expected > k => None,
+                            _ => Some(expected),
+                        };
+                        assert_eq!(
+                            result.edit_distance(),
+                            distance,
+                            "query len {len}, target len {}, {mode:?} {task:?} {limit:?}",
+                            target.len()
+                        );
+                        if distance.is_none() || task == AlignmentTask::Distance {
+                            continue;
+                        }
+                        for span in result.locations().unwrap() {
+                            assert_eq!(
+                                reference_distance(&query, &target[span], AlignmentMode::Global),
+                                expected
+                            );
+                        }
+                        if task == AlignmentTask::Path {
+                            assert_path_is_valid(&query, target, &result);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn alignment_modes_match_independent_edit_distance() {
     // Exhaust all binary strings up to length four, including the empty one.
     let sequences: Vec<Vec<u8>> = (0..=4)

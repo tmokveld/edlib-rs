@@ -51,6 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Defaults are global alignment, distance and end locations, and no distance limit.
 `edit_distance()` returns `None` when the configured limit is exceeded.
 `locations()` exposes half-open target spans when start locations were requested.
+In infix mode, an empty query matches every target boundary. A requested
+zero-length path is returned as `Some(&[])` and formats as an empty CIGAR string.
 Raw bindings are available through `edlib_sys` or `edlib_rs::edlib`.
 
 ## Regenerating bindings

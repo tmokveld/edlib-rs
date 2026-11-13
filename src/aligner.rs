@@ -78,8 +78,11 @@ fn validate_lengths(query_len: usize, target_len: usize) -> Result<(), AlignErro
     // buildPeq allocates (alphabetLength + 1) * queryBlocks using signed ints.
     // Reserve a row for the wildcard, even when all 256 byte values occur.
     let max_query_blocks = i32::MAX as usize / 257;
+    // An empty infix can return target_len + 1 locations. Rust slices must
+    // occupy at most isize::MAX bytes, including on 32-bit targets.
     if total.is_none_or(|len| len > (i32::MAX / 4) as usize)
         || query_len.div_ceil(64) > max_query_blocks
+        || target_len >= isize::MAX as usize / size_of::<c_int>()
     {
         return Err(AlignError::InputTooLong);
     }
@@ -93,11 +96,13 @@ fn validate_lengths(query_len: usize, target_len: usize) -> Result<(), AlignErro
 /// signed length arithmetic, block rounding, and adaptive distance doubling.
 /// Query length is additionally limited to `(i32::MAX / 257) * 64` bytes so
 /// edlib's query-table element count fits a signed int for any byte alphabet.
+/// Target length also leaves room for `target.len() + 1` location integers in
+/// a Rust slice, which must not exceed `isize::MAX` bytes.
 /// A distance limit larger than either input is clamped to their maximum length
 /// (a valid upper bound on edit distance).
 ///
-/// Empty inputs are solved without edlib, honoring `max_distance` and the
-/// requested task like any other input.
+/// Empty inputs honor the distance limit and requested task. In infix mode,
+/// an empty query matches every target boundary, including after the last byte.
 ///
 /// C++ exceptions escaping edlib terminate the process.
 ///
@@ -117,12 +122,6 @@ pub fn align(
     validate_lengths(query.len(), target.len())?;
     let equality_count = i32::try_from(config.additional_equalities.len())
         .map_err(|_| AlignError::TooManyEqualities)?;
-    if query.is_empty() || target.is_empty() {
-        // Edlib's shortcut for these ignores k and omits start locations and path.
-        return Ok(Alignment {
-            storage: Storage::Empty(align_empty(query.len(), target.len(), config)),
-        });
-    }
     let native_config = sys::EdlibAlignConfig {
         k: config
             .max_distance
@@ -156,9 +155,10 @@ pub fn align(
     };
     // Take ownership first so the buffers are freed on every error path.
     let native = NativeResult(raw);
-    check_native(&native.0, config.task)?;
+    check_native(&native.0, config.task, query.len())?;
     let result = Alignment {
-        storage: Storage::Native(native),
+        native,
+        has_path: config.task == AlignmentTask::Path && raw.editDistance >= 0,
     };
     if !result.has_valid_locations(target.len()) {
         return Err(AlignError::NativeFailure);
@@ -168,14 +168,25 @@ pub fn align(
 
 /// Rejects results whose buffers do not match what the task promises, so the
 /// accessors can trust the pointers and lengths.
-fn check_native(raw: &sys::EdlibAlignResult, task: AlignmentTask) -> Result<(), AlignError> {
+fn check_native(
+    raw: &sys::EdlibAlignResult,
+    task: AlignmentTask,
+    query_len: usize,
+) -> Result<(), AlignError> {
     if raw.status != sys::EDLIB_STATUS_OK as c_int {
         return Err(AlignError::NativeFailure);
     }
     let found = raw.editDistance >= 0;
     let expect = |ptr_is_null: bool, wanted: bool| ptr_is_null != (found && wanted);
-    // Edlib ignores failures while computing the path and still reports success,
-    // leaving the alignment pointer null.
+    let wants_path = found && task == AlignmentTask::Path;
+    let empty_path = wants_path && query_len == 0 && raw.editDistance == 0;
+    // Native path-search failures leave the pointer null even on success.
+    // Only a zero-distance empty query legitimately has a zero-length path.
+    let valid_path = if wants_path && !empty_path {
+        !raw.alignment.is_null() && raw.alignmentLength > 0
+    } else {
+        raw.alignment.is_null() && raw.alignmentLength == 0
+    };
     let consistent = raw.editDistance >= -1
         && raw.numLocations >= 0
         && raw.alignmentLength >= 0
@@ -185,7 +196,7 @@ fn check_native(raw: &sys::EdlibAlignResult, task: AlignmentTask) -> Result<(), 
             raw.startLocations.is_null(),
             task != AlignmentTask::Distance,
         )
-        && expect(raw.alignment.is_null(), task == AlignmentTask::Path);
+        && valid_path;
     if consistent {
         Ok(())
     } else {
@@ -193,49 +204,15 @@ fn check_native(raw: &sys::EdlibAlignResult, task: AlignmentTask) -> Result<(), 
     }
 }
 
-/// Solves alignment against an empty sequence. Every query byte is an
-/// insertion; in global mode every target byte is also a deletion.
-fn align_empty(query_len: usize, target_len: usize, config: &AlignConfig<'_>) -> EmptyResult {
-    let span = if config.mode == AlignmentMode::Global {
-        target_len
-    } else {
-        0
-    };
-    let distance = (query_len + span) as u32;
-    if config.max_distance.is_some_and(|k| distance > k) {
-        return EmptyResult {
-            distance: None,
-            end: [-1],
-            start: None,
-            path: None,
-        };
-    }
-    EmptyResult {
-        distance: Some(distance),
-        end: [span as i32 - 1],
-        start: (config.task != AlignmentTask::Distance).then_some([0]),
-        path: (config.task == AlignmentTask::Path).then(|| {
-            let mut path = vec![EditOperation::Insert; query_len];
-            path.resize(query_len + span, EditOperation::Delete);
-            path
-        }),
-    }
-}
-
-/// Owns edlib's result buffers, or the result for an empty input.
+/// Owns edlib's result buffers.
 /// Accessors borrow them without copying.
 #[derive(Debug)]
 pub struct Alignment {
-    storage: Storage,
+    native: NativeResult,
+    has_path: bool,
 }
 
-#[derive(Debug)]
-enum Storage {
-    Native(NativeResult),
-    Empty(EmptyResult),
-}
-
-/// Sole owner of a successful, [`check_native`]-validated edlib result.
+/// Owns an edlib result, including while its contents are being validated.
 #[derive(Debug)]
 struct NativeResult(sys::EdlibAlignResult);
 
@@ -250,15 +227,6 @@ impl Drop for NativeResult {
         // pointers before any work, making every returned result freeable.
         unsafe { sys::edlibFreeAlignResult(self.0) }
     }
-}
-
-#[derive(Debug)]
-struct EmptyResult {
-    distance: Option<u32>,
-    /// Meaningful only when `distance` is `Some`.
-    end: [i32; 1],
-    start: Option<[i32; 1]>,
-    path: Option<Vec<EditOperation>>,
 }
 
 const _: () = {
@@ -276,10 +244,7 @@ unsafe fn native_slice<'a, T>(ptr: *const T, len: c_int) -> Option<&'a [T]> {
 impl Alignment {
     /// `None` means no alignment within the configured distance limit.
     pub fn edit_distance(&self) -> Option<u32> {
-        match &self.storage {
-            Storage::Native(native) => u32::try_from(native.0.editDistance).ok(),
-            Storage::Empty(empty) => empty.distance,
-        }
+        u32::try_from(self.native.0.editDistance).ok()
     }
 
     /// Zero-based inclusive target end positions; `-1` denotes an empty span
@@ -287,28 +252,19 @@ impl Alignment {
     /// [`Self::locations`], which cannot be misread as unsigned.
     /// Empty when no alignment met the distance limit.
     pub fn end_locations(&self) -> &[i32] {
-        match &self.storage {
-            // SAFETY: check_native verified endLocations holds numLocations
-            // ints when non-null; they are owned by self.
-            Storage::Native(native) => unsafe {
-                native_slice(native.0.endLocations, native.0.numLocations).unwrap_or(&[])
-            },
-            Storage::Empty(empty) if empty.distance.is_some() => &empty.end,
-            Storage::Empty(_) => &[],
+        // SAFETY: the native buffer contains numLocations initialized ints
+        // and is owned by self. Validation checked the length and presence.
+        unsafe {
+            native_slice(self.native.0.endLocations, self.native.0.numLocations).unwrap_or(&[])
         }
     }
 
     /// Zero-based inclusive starts corresponding to [`Self::end_locations`],
     /// or `None` if not computed. A start exceeds its end when the span is empty.
     pub fn start_locations(&self) -> Option<&[i32]> {
-        match &self.storage {
-            // SAFETY: check_native verified startLocations holds numLocations
-            // ints when non-null; they are owned by self.
-            Storage::Native(native) => unsafe {
-                native_slice(native.0.startLocations, native.0.numLocations)
-            },
-            Storage::Empty(empty) => empty.start.as_ref().map(|start| start.as_slice()),
-        }
+        // SAFETY: the native buffer contains numLocations initialized ints
+        // when present and is owned by self.
+        unsafe { native_slice(self.native.0.startLocations, self.native.0.numLocations) }
     }
 
     /// Exclusive target end offsets, in the order of [`Self::end_locations`].
@@ -332,16 +288,18 @@ impl Alignment {
     }
 
     /// Path for the first location pair, or `None` if not computed.
+    /// A computed zero-length path is `Some(&[])`, not `None`.
     pub fn path(&self) -> Option<&[EditOperation]> {
-        match &self.storage {
-            // SAFETY: edlib writes only codes 0..=3, matching this repr(u8)
-            // enum. check_native verified alignment holds alignmentLength bytes
-            // when non-null; they are owned by self.
-            Storage::Native(native) => unsafe {
-                native_slice(native.0.alignment.cast(), native.0.alignmentLength)
-            },
-            Storage::Empty(empty) => empty.path.as_deref(),
+        if !self.has_path {
+            return None;
         }
+        // SAFETY: edlib writes only codes 0..=3, matching this repr(u8) enum.
+        // The buffer has alignmentLength initialized bytes and is owned by
+        // self. Validation permits a null pointer only for an empty path.
+        Some(unsafe {
+            native_slice(self.native.0.alignment.cast(), self.native.0.alignmentLength)
+                .unwrap_or(&[])
+        })
     }
 
     /// A borrowed, allocation-free CIGAR formatter, or `None` without a path.
@@ -437,9 +395,11 @@ mod tests {
         );
 
         let largest_total = (i32::MAX / 4) as usize;
-        assert_eq!(validate_lengths(0, largest_total), Ok(()));
+        let largest_target =
+            largest_total.min(isize::MAX as usize / size_of::<std::os::raw::c_int>() - 1);
+        assert_eq!(validate_lengths(0, largest_target), Ok(()));
         assert_eq!(
-            validate_lengths(0, largest_total + 1),
+            validate_lengths(0, largest_target + 1),
             Err(AlignError::InputTooLong)
         );
         assert_eq!(
@@ -462,7 +422,7 @@ mod tests {
             alignmentLength: 1,
             alphabetLength: 1,
         };
-        assert_eq!(check_native(&found, AlignmentTask::Path), Ok(()));
+        assert_eq!(check_native(&found, AlignmentTask::Path, 1), Ok(()));
         let missed = sys::EdlibAlignResult {
             editDistance: -1,
             endLocations: ptr::null_mut(),
@@ -472,7 +432,7 @@ mod tests {
             alignmentLength: 0,
             ..found
         };
-        assert_eq!(check_native(&missed, AlignmentTask::Path), Ok(()));
+        assert_eq!(check_native(&missed, AlignmentTask::Path, 1), Ok(()));
 
         // Edlib discards path-search failures but still reports success.
         let pathless = sys::EdlibAlignResult {
@@ -481,7 +441,7 @@ mod tests {
             ..found
         };
         assert_eq!(
-            check_native(&pathless, AlignmentTask::Path),
+            check_native(&pathless, AlignmentTask::Path, 1),
             Err(AlignError::NativeFailure)
         );
         let startless = sys::EdlibAlignResult {
@@ -489,7 +449,7 @@ mod tests {
             ..found
         };
         assert_eq!(
-            check_native(&startless, AlignmentTask::Locations),
+            check_native(&startless, AlignmentTask::Locations, 1),
             Err(AlignError::NativeFailure)
         );
         let errored = sys::EdlibAlignResult {
@@ -497,7 +457,20 @@ mod tests {
             ..found
         };
         assert_eq!(
-            check_native(&errored, AlignmentTask::Path),
+            check_native(&errored, AlignmentTask::Path, 1),
+            Err(AlignError::NativeFailure)
+        );
+
+        let mut empty_end = [-1];
+        let mut empty_start = [0];
+        let empty_path = sys::EdlibAlignResult {
+            endLocations: empty_end.as_mut_ptr(),
+            startLocations: empty_start.as_mut_ptr(),
+            ..pathless
+        };
+        assert_eq!(check_native(&empty_path, AlignmentTask::Path, 0), Ok(()));
+        assert_eq!(
+            check_native(&empty_path, AlignmentTask::Path, 1),
             Err(AlignError::NativeFailure)
         );
     }

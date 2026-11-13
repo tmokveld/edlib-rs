@@ -1,0 +1,3 @@
+[submodule "edlib-sys/edlib"]
+	path = edlib-sys/edlib
+	url = https://github.com/tmokveld/edlib.git

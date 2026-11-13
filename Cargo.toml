@@ -1,0 +1,18 @@
+[package]
+name = "edlib-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.1"
+publish = false
+description = "Safe Rust bindings to edlib sequence alignment"
+repository = "https://github.com/tmokveld/edlib-rs"
+
+[workspace]
+members = ["edlib-sys"]
+
+[features]
+# Regenerate the raw bindings with bindgen (requires libclang).
+bindgen = ["edlib-sys/bindgen"]
+
+[dependencies]
+edlib-sys = { path = "edlib-sys" }

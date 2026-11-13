@@ -1,0 +1,18 @@
+[package]
+name = "edlib-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.1"
+publish = false
+links = "edlib"
+description = "Raw bindings to bundled edlib"
+repository = "https://github.com/tmokveld/edlib-rs"
+
+[features]
+# Regenerate bindings with bindgen (requires libclang) instead of using the
+# committed src/bindings.rs.
+bindgen = ["dep:bindgen"]
+
+[build-dependencies]
+bindgen = { version = "0.72", optional = true }
+cc = "1"
